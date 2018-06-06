@@ -151,7 +151,7 @@ class VoteBot:
         INFO("成功获取成员列表成功")
 
     def getTeamList(self):
-        self.get('https://akb48-sousenkyo.jp/akb/search/teams', 1, '.wrap h1')
+        self.get('https://akb48-sousenkyo.jp/akb/search/teams', '.wrap h1')
         a = self.find_by_css_s('dd a')
         return [(dd.text, dd.get_attribute('href')) for dd in a]
 
