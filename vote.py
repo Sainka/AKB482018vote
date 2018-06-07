@@ -5,6 +5,7 @@ import re
 import signal
 import sys
 import time
+from argparse import ArgumentParser
 from random import randint
 
 from selenium import webdriver
@@ -69,7 +70,6 @@ logging.getLogger("").setLevel(logging.CRITICAL)
 
 utf8Logger = Utf8Logger('Utf8Logger')
 
-
 _thisDict = globals()
 
 for name in ('CRITICAL', 'ERROR', 'WARN', 'INFO', 'DEBUG'):
@@ -78,11 +78,11 @@ for name in ('CRITICAL', 'ERROR', 'WARN', 'INFO', 'DEBUG'):
 RAWINPUT = input
 
 
-def Utf8File(name):
-    logger = logging.getLogger(name)
+def Utf8File(lname):
+    logger = logging.getLogger(lname)
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        logfile = os.path.abspath('vote-%d.log' % randint(100000, 999999))
+        logfile = os.path.abspath('%s.log' % lname)
         ch = logging.FileHandler(logfile, mode='w', encoding='utf-8')
         fmt = "'%(asctime)s', %(message)s"
         datefmt = '%Y-%m-%d %H:%M:%S'
@@ -91,19 +91,20 @@ def Utf8File(name):
     return logger
 
 
-utf8File = None
+utf8FileList = {}
 
 
-def FILE(s):
-    global utf8File
-    if not utf8File:
-        utf8File = Utf8File('file')
-    utf8File.info(s)
+def FILE(s, lname="vote"):
+    global utf8FileList
+    if lname not in utf8FileList:
+        utf8FileList[lname] = Utf8File(lname)
+    utf8FileList[lname].info(s)
 
 
 def PRINT(s, end='\n'):
     utf8Stdout.write(s + end)
     utf8Stdout.flush()
+
 
 class State():
     def __init__(self, s1, s2, name, url, msg):
@@ -173,8 +174,10 @@ class VoteBot:
 
     def getBrowser(self, headless=False):
         options = webdriver.ChromeOptions()
+        options.add_argument('test-type')
         if headless:
             options.add_argument('headless')
+            options.add_argument('disable-gpu')
         options.add_argument('lang=zh_CN.UTF-8')
         options.add_argument(
             'user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.181 Safari/537.36"')
@@ -199,30 +202,52 @@ class VoteBot:
             return State(s1, s2, name, url, self.getMsg());
         return State(s1, s2, name, url, '投票失败请检查你的网络')
 
-    def voteFromFile(self, filePath, name):
+    def voteOneByOne(self, name, out=False):
+        url, msg = self.getLinkWithNamecheck(name, False)
+        if not url: return [msg]
+        id = 0
+        while True:
+            s = RAWINPUT('请输入序列号(输入exit退出):')
+            if s == 'exit': return '退出脚本'
+            s1, s2 = self.serialCheck(s)
+            if s1 and s2:
+                state = self.voteNoSafeCheck(s1, s2, name, url)
+            else:
+                state = State(s.strip(), '', name, url, ('投票エラー', '投票码格式错误'))
+            INFO('%d, ' % id + str(state))
+            if not out:
+                FILE('%d, ' % id + str(state))
+            id += 1
+
+    def voteFromFile(self, filePath, name, delay):
         url, msg = self.getLinkWithNamecheck(name)
         if not url: return msg
-
         INFO('验证成功，倒计时13s后开始投票给(%s),如果有任何疑问，您可以使用(ctrl + c)主动退出程序' % name)
-        self.countdown(13)
+        countdown(13)
         INFO('投票开始(%s)' % name)
+        return self.voteBatchNoSafeCheck(filePath, url, name, delay)
 
+    def voteBatchNoSafeCheck(self, filePath, url, name, delay):
         with open(filePath) as f:
             id = 0
             while True:
                 lines = f.readlines(100)
                 if not lines: break
                 for serial in lines:
+                    serial = serial.strip()
                     if len(serial) > 0:
                         s1, s2 = self.serialCheck(serial)
                         if s1 and s2:
                             state = self.voteNoSafeCheck(s1, s2, name, url)
                         else:
-                            state = State(serial.strip(), '', name, url, ('投票エラー', '注册码格式错误'))
+                            state = State(serial.strip(), '', name, url, ('投票エラー', '投票码格式错误'))
                         INFO('%d, ' % id + str(state))
-                        FILE('%d, ' % id + str(state))
+                        FILE('%d, ' % id + str(state), f.name)
                         id += 1
-
+                        if id + 1 % delay[2] == 0:
+                            time.sleep(delay[0] / 1000)
+                        else:
+                            time.sleep(delay[1] / 1000)
         return '投票完成(%s)' % name
 
     def checkVotePaper(self, name):
@@ -244,9 +269,23 @@ class VoteBot:
     def find_by_css_s(self, css):
         return self.driver.find_elements_by_css_selector(css)
 
-    def get(self, url, css, time=5):
-        self.driver.get(url)
-        WebDriverWait(self.driver, time).until(EC.visibility_of(self.find_by_css(css)))
+    def get(self, url, css, wtime=5):
+        t = 0
+        while True:
+            self.driver.get(url)
+            try:
+                WebDriverWait(self.driver, wtime).until(EC.visibility_of(self.find_by_css(css)))
+            except:
+                if self.driver.current_url == "https://akb48-sousenkyo.jp/akb/top/error?error=":
+                    self.driver.get('https://akb48-sousenkyo.jp/akb/search/results?t_id=1')
+                    time.sleep(1)
+                else:
+                    if t >= 5:
+                        raise TimeoutError("五次尝试后并不能访问正确的网络地址，脚本异常退出")
+                    else:
+                        t += 1
+            else:
+                break
 
     def _find_link_by_name(self, name):
         if name in self.number:
@@ -257,22 +296,6 @@ class VoteBot:
     def close(self):
         if self.driver:
             self.driver.close()
-
-    def countdown(self, lineLength, ds=1, fs='=', fs2=['-', '\\', '|', '/'], bs=''):
-        def ext(signum, frame):
-            print('')
-            ERROR('您使用(ctrl + c)主动退出了程序')
-            exit(0)
-
-        signal.signal(signal.SIGINT, ext)
-        signal.signal(signal.SIGTERM, ext)
-
-        lineTmpla = '{:%s<%s} {} {:<2}' % (bs, lineLength)
-        for s in range(lineLength):
-            j = lineLength - s
-            print('\r' + lineTmpla.format(fs * j, fs2[j % (len(fs2))], j), end='')
-            time.sleep(ds)
-        print('\r' + '  ' * lineLength + '\r', end='')
 
     def inputCheck(self, msg, val):
         return RAWINPUT(msg) == val
@@ -288,8 +311,26 @@ class VoteBot:
                 return None, '输入(%s)与预期不符,退出程序' % s
         return url, ''
 
-    def serialCheck(self,s1,s2=None):
+    def serialCheck(self, s1, s2=None):
         return _serialCheck(s1, s2)
+
+
+def countdown(lineLength, ds=1, fs='=', fs2=['-', '\\', '|', '/'], bs=''):
+    def ext(signum, frame):
+        print('')
+        ERROR('您使用(ctrl + c)主动退出了程序')
+        exit(0)
+
+    signal.signal(signal.SIGINT, ext)
+    signal.signal(signal.SIGTERM, ext)
+
+    lineTmpla = '{:%s<%s} {} {:<2}' % (bs, lineLength)
+    for s in range(lineLength):
+        j = lineLength - s
+        print('\r' + lineTmpla.format(fs * j, fs2[j % (len(fs2))], j), end='')
+        time.sleep(ds)
+    print('\r' + '  ' * lineLength + '\r', end='')
+
 
 def _serialCheck(s1, s2=None):
     if s2 is None:
@@ -313,36 +354,127 @@ def _serialCheck(s1, s2=None):
 def _argparse():
     parser = argparse.ArgumentParser(description="AKB48 2018年世界总选举自助投票程序")
     parser.add_argument('-headless', action='store_true', help='启用浏览器无头模式')
+    parser.set_defaults(func=lambda x: PRINT('use (-h)'))
 
     subparsers = parser.add_subparsers()
     voteParser = subparsers.add_parser('vote', help='投票')
-    voteParser.add_argument('-name', type=str, required=True, help='目标成员日语全名，使用空格分隔姓与名，并包括在双引号里，如(-name "大岛 优子")')
-    voteGroup = voteParser.add_mutually_exclusive_group(required=True)
-    voteGroup.add_argument('-serial', type=str, nargs=2,
-                           help='序列码，使用空格分隔序列码前后的两部分，每部分各八位共十六位，如(-serial 12345678 87654321)')
-    voteGroup.add_argument('-file', type=str, help='序列码列表文件，每条序列码占用一行，使用空格分隔序列码前后的两部分，每部分各八位共十六位')
+    voteParser.set_defaults(func=lambda x: PRINT('use (vote -h)'))
+    voteSubParser = voteParser.add_subparsers()
+    oneVoteParser = voteSubParser.add_parser('one', help='投入一票')
+    oneVoteParser.add_argument('-serial', type=str, nargs=2, required=True,
+                               help='序列码，使用空格分隔序列码前后的两部分，每部分各八位共十六位，如(-serial 12345678 87654321)')
+    oneVoteParser.add_argument('-name', type=str, required=True, help='目标成员日语全名，使用空格分隔姓与名，并包括在双引号里，如(-name "大岛 优子")')
+    oneVoteParser.set_defaults(func=oneVote)
+
+    batchVoteParser = voteSubParser.add_parser('batch', help='读取投票码文件批量投票')
+    batchVoteParser.add_argument('-name', type=str, required=True, help='目标成员日语全名，使用空格分隔姓与名，并包括在双引号里，如(-name "大岛 优子")')
+    batchVoteParser.add_argument('-file', type=str, required=True, help='序列码列表文件，每条序列码占用一行，使用空格分隔序列码前后的两部分，每部分各八位共十六位')
+    batchVoteParser.add_argument('-delay', type=int, nargs=3, default=[1000, 500, 10],
+                                 help='主动延迟,如（2000 500 10）表示投出十票后暂停两秒，每票投出后主动暂停0.5秒')
+    batchVoteParser.add_argument('-pnum', type=int, nargs=2, default=[1, 1024],
+                                 help='运行的进程数，最大值为cpu核心数的两倍，多进程时分隔的文件大小')
+    batchVoteParser.set_defaults(func=batchVoteMultiProcessing)
+
+    stepVoteParser = voteSubParser.add_parser('step', help='根据提示一步步接续投票')
+    stepVoteParser.add_argument('-name', type=str, required=True, help='目标成员日语全名，使用空格分隔姓与名，并包括在双引号里，如(-name "大岛 优子")')
+    stepVoteParser.add_argument('-out', action='store_true', help='投票信息是否记录到文件')
+    stepVoteParser.set_defaults(func=stepVote)
+
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    arg = _argparse()
+def stepVote(arg):
+    bot = botInit(arg)
+    INFO(bot.voteOneByOne(arg.name, arg.out))
+    bot.close()
 
+
+def oneVote(arg):
     if arg.serial and None in _serialCheck(arg.serial[0], arg.serial[1]):
         ERROR('(%s,%s)错误的序列号格式' % (arg.serial[0], arg.serial[1]))
-        sys.exit(0)
-    elif arg.file and not os.path.exists(arg.file):
-        ERROR('(%s)文件未找到' % arg.file)
-        sys.exit(0)
+    else:
+        bot = botInit(arg)
+        INFO(bot.vote(arg.serial[0], arg.serial[1], arg.name))
+        bot.close()
 
+
+def split(fromfile, todir, chunkLineSize):
+    if not os.path.exists(todir):  # check whether todir exists or not
+        os.mkdir(todir)
+    else:
+        for fname in os.listdir(todir):
+            os.remove(os.path.join(todir, fname))
+    partnum = 0
+    with open(fromfile, 'rb') as input:
+        while True:
+            chunk = input.readlines(chunkLineSize)
+            if not chunk:  break
+            filename = os.path.join(todir, ('part%04d' % partnum))
+            with open(filename, 'wb') as out:
+                out.writelines(chunk)
+            partnum += 1
+    return partnum
+
+
+def batchVoteSingleton(args):
+    if args.file and not os.path.exists(args.file):
+        ERROR('(%s)文件未找到' % args.file)
+    else:
+        bot = botInit(args)
+        INFO(bot.voteFromFile(args.file, args.name, args.delay))
+        bot.close()
+
+
+def func(args, fname):
+    bot = botInit(args)
+    nname, ename, url = bot._find_link_by_name(args.name)
+    if url:
+        INFO(bot.voteBatchNoSafeCheck(fname, url, args.name, args.delay))
+    else:
+        INFO('(%s)不是有效的成员姓名,请检查你的输入' % name)
+    bot.close()
+
+
+def batchVoteMultiProcessing(args):
+    if args.pnum[0] <= 1:
+        batchVoteSingleton(args)
+        return
+
+    from multiprocessing import Pool, cpu_count
+    if args.file and not os.path.exists(args.file):
+        ERROR('(%s)文件未找到' % args.file)
+    else:
+        s = RAWINPUT("确认要投票给(%s),请再次输入成员姓名:" % args.name)
+        if s != args.name:
+            ERROR('输入(%s)与预期不符,退出程序' % s)
+        else:
+            INFO('验证成功，倒计时13s后开始投票给(%s),如果有任何疑问，您可以使用(ctrl + c)主动退出程序' % args.name)
+            countdown(13)
+            INFO('投票开始(%s)' % args.name)
+
+            p = Pool(cpu_count() * 2 if (args.pnum[0] > cpu_count() * 2) else args.pnum[0])
+            tempFileCount = split(args.file, 'temp', args.pnum[1] if args.pnum[1] > 0 else 1024)
+            for partnum in range(tempFileCount):
+                fname = 'temp\\part%04d' % partnum
+                INFO(fname)
+                p.apply_async(func, (args, fname))
+                time.sleep(0.5)
+            INFO('...........')
+            p.close()
+            p.join()
+
+
+def botInit(arg):
     try:
         bot = VoteBot(arg.headless)
+        bot.initVoteInfo()
+        return bot
     except Exception as e:
         ERROR(e)
         sys.exit(0)
 
-    bot.initVoteInfo()
-    if arg.file:
-        INFO(bot.voteFromFile(arg.file, arg.name))
-    elif arg.serial:
-        INFO(bot.vote(arg.serial[0], arg.serial[1], arg.name))
-    bot.close()
+
+if __name__ == "__main__":
+    args = _argparse()
+    DEBUG(args)
+    args.func(args)
