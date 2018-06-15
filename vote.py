@@ -4,107 +4,21 @@ import pickle
 import re
 import signal
 import sys
+import threading
 import time
 from argparse import ArgumentParser
+from multiprocessing import cpu_count, Pool, JoinableQueue
 from random import randint
+import itertools
 
 from selenium import webdriver
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
+from vote import INFO, FILE, DEBUG, ERROR, RAWINPUT, PRINT, pt, ft
+from functools import reduce
 
-p = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if p not in sys.path:
-    sys.path.insert(0, p)
-
-import sys, logging
-
-
-def equalUtf8(coding):
-    return coding is None or coding.lower() in ('utf8', 'utf-8', 'utf_8')
-
-
-class CodingWrappedWriter(object):
-    def __init__(self, coding, writer):
-        self.flush = getattr(writer, 'flush', lambda: None)
-
-        wcoding = getattr(writer, 'encoding', None)
-        wcoding = 'gb18030' if (wcoding in ('gbk', 'cp936')) else wcoding
-
-        if not equalUtf8(wcoding):
-            self._write = lambda s: writer.write(
-                s.decode(coding).encode(wcoding, 'ignore')
-            )
-        else:
-            self._write = writer.write
-
-    def write(self, s):
-        self._write(s)
-        self.flush()
-
-
-import io
-
-if hasattr(sys.stdout, 'buffer') and (not equalUtf8(sys.stdout.encoding)):
-    if sys.stdout.encoding in ('gbk', 'cp936'):
-        coding = 'gb18030'
-    else:
-        coding = 'utf-8'
-    utf8Stdout = io.TextIOWrapper(sys.stdout.buffer, encoding=coding)
-else:
-    utf8Stdout = sys.stdout
-
-
-def Utf8Logger(name):
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        ch = logging.StreamHandler(utf8Stdout)
-        fmt = '[%(asctime)s] [%(levelname)s] %(message)s'
-        datefmt = '%Y-%m-%d %H:%M:%S'
-        ch.setFormatter(logging.Formatter(fmt, datefmt))
-        logger.addHandler(ch)
-    return logger
-
-
-logging.getLogger("").setLevel(logging.CRITICAL)
-
-utf8Logger = Utf8Logger('Utf8Logger')
-
-_thisDict = globals()
-
-for name in ('CRITICAL', 'ERROR', 'WARN', 'INFO', 'DEBUG'):
-    _thisDict[name] = getattr(utf8Logger, name.lower())
-
-RAWINPUT = input
-
-
-def Utf8File(lname):
-    logger = logging.getLogger(lname)
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        logfile = os.path.abspath('%s.log' % lname)
-        ch = logging.FileHandler(logfile, mode='w', encoding='utf-8')
-        fmt = "'%(asctime)s', %(message)s"
-        datefmt = '%Y-%m-%d %H:%M:%S'
-        ch.setFormatter(logging.Formatter(fmt, datefmt))
-        logger.addHandler(ch)
-    return logger
-
-
-utf8FileList = {}
-
-
-def FILE(s, lname="vote"):
-    global utf8FileList
-    if lname not in utf8FileList:
-        utf8FileList[lname] = Utf8File(lname)
-    utf8FileList[lname].info(s)
-
-
-def PRINT(s, end='\n'):
-    utf8Stdout.write(s + end)
-    utf8Stdout.flush()
-
+def flatMap(func, iterable):
+   return map(func,itertools.chain.from_iterable(iterable))
 
 class State():
     def __init__(self, s1, s2, name, url, msg):
@@ -115,72 +29,58 @@ class State():
         self.msg = msg
 
     def __str__(self):
-        return "'%s', '%s', '%s', '%s', %s" % (self.s1, self.s2, self.name, self.url, str(self.msg)[1:-1])
-
-
-class PlickelTool():
-    def load(self, filePath):
-        if os.path.exists(filePath):
-            with open(filePath, 'rb') as f:
-                return pickle.load(f)
-        return None, None
-
-    def save(self, filePath, obj):
-        with open(filePath, 'wb') as f:
-            pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+        return "%s, %s, %s, %s, %s" % (self.s1, self.s2, self.name, self.url, str(self.msg)[1:-1])
 
 
 class VoteBot:
     from selenium import webdriver
-    def __init__(self, headless=False):
-        self.driver = self.getBrowser(headless)
-        if headless:
-            INFO("浏览器初始化完成(headless)")
-        else:
-            INFO("浏览器初始化完成")
+    def __init__(self, headless=False,noimages=False):
+        self.driver = self.getBrowser(headless,noimages)
+        INFO('浏览器初始化完成'
+             + ('(headless)'if headless else '')
+             + ('(noimages)'if noimages else ''))
 
     def initVoteInfo(self):
         fp = os.path.abspath('numberList.pickle');
-        pt = PlickelTool()
         self.team, self.number = pt.load(fp)
         if not self.number or not self.team:
             self.team = self.getTeamList()
-            self.number = self.getNumberList()
+            self.number = self.getNumberList(self.team)
             pt.save(fp, (self.team, self.number))
         else:
             self.get('https://akb48-sousenkyo.jp/akb/search/results?t_id=1', '.wrap h1')
-        INFO("成功获取成员列表成功")
+        INFO("成员列表获取成功")
 
     def getTeamList(self):
         self.get('https://akb48-sousenkyo.jp/akb/search/teams', '.wrap h1')
         a = self.find_by_css_s('dd a')
-        return [(dd.text, dd.get_attribute('href')) for dd in a]
+        return [(dd.text,dd.get_attribute('href')) for dd in a]
 
     def getNumberInfo(self, link):
         self.get(link, '.wrap h1')
         list = self.find_by_css_s('dd a')
         return [(dd.text, dd.get_attribute('href')) for dd in list]
 
-    def getNumberList(self):
-        l = []
-        for (team, link) in self.team:
-            l += self.getNumberInfo(link)
+    def getNumberList(self,teamlist):
+        return reduce(lambda d1,d2:dict(d1,**d2),
+                      map(lambda ninfo:{ninfo[0][0]: (ninfo[0][0], ninfo[0][1], ninfo[1])},
+                          flatMap(lambda ninfo:(ninfo[0].split('／'),ninfo[1]) ,
+                                  map(lambda tinfo:self.getNumberInfo(tinfo[1]),teamlist))))
 
-        dic = {}
-        for (name, link) in l:
-            a = name.split('／')
-            dic.update({a[0]: (a[0], a[1], link)})
-        return dic
-
-    def getBrowser(self, headless=False):
+    def getBrowser(self, headless=False,noimages=False):
         options = webdriver.ChromeOptions()
-        options.add_argument('test-type')
+        # options.add_argument('test-type')
+
         if headless:
             options.add_argument('headless')
-            options.add_argument('disable-gpu')
+
+        if noimages:
+            options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
+
         options.add_argument('lang=zh_CN.UTF-8')
         options.add_argument(
             'user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.181 Safari/537.36"')
+        options.add_experimental_option("excludeSwitches", ["ignore-certificate-errors"])
         browser = webdriver.Chrome(chrome_options=options)
         browser.implicitly_wait(10)
         return browser
@@ -227,27 +127,29 @@ class VoteBot:
         INFO('投票开始(%s)' % name)
         return self.voteBatchNoSafeCheck(filePath, url, name, delay)
 
-    def voteBatchNoSafeCheck(self, filePath, url, name, delay):
+    def readline(self,filePath,hint: int = -1):
         with open(filePath) as f:
-            id = 0
             while True:
-                lines = f.readlines(100)
+                lines = f.readlines(hint)
                 if not lines: break
-                for serial in lines:
-                    serial = serial.strip()
-                    if len(serial) > 0:
-                        s1, s2 = self.serialCheck(serial)
-                        if s1 and s2:
-                            state = self.voteNoSafeCheck(s1, s2, name, url)
-                        else:
-                            state = State(serial.strip(), '', name, url, ('投票エラー', '投票码格式错误'))
-                        INFO('%d, ' % id + str(state))
-                        FILE('%d, ' % id + str(state), f.name)
-                        id += 1
-                        if id + 1 % delay[2] == 0:
-                            time.sleep(delay[0] / 1000)
-                        else:
-                            time.sleep(delay[1] / 1000)
+                for line in lines:
+                    yield line
+
+
+    def voteBatchNoSafeCheck(self, filePath, url, name, delay):
+        id = 0
+        for serial in self.readline(filePath,100):
+            if not serial:break
+            serial = serial.strip()
+            if len(serial) > 0:
+                s1, s2 = self.serialCheck(serial)
+                if s1 and s2:
+                    state = self.voteNoSafeCheck(s1, s2, name, url)
+                else:
+                    state = State(serial.strip(), '', name, url, ('投票エラー', '投票码格式错误'))
+                INFO("%s, %d, " % (threading.current_thread().name, id) + str(state))
+                FILE("%d, " % id + str(state), filePath)
+                id += 1
         return '投票完成(%s)' % name
 
     def checkVotePaper(self, name):
@@ -269,16 +171,16 @@ class VoteBot:
     def find_by_css_s(self, css):
         return self.driver.find_elements_by_css_selector(css)
 
-    def get(self, url, css, wtime=5):
+    def get(self, url, css, wtime=3):
         t = 0
         while True:
             self.driver.get(url)
             try:
                 WebDriverWait(self.driver, wtime).until(EC.visibility_of(self.find_by_css(css)))
-            except:
+            except Exception as e:
+                ERROR(e)
                 if self.driver.current_url == "https://akb48-sousenkyo.jp/akb/top/error?error=":
                     self.driver.get('https://akb48-sousenkyo.jp/akb/search/results?t_id=1')
-                    time.sleep(1)
                 else:
                     if t >= 5:
                         raise TimeoutError("五次尝试后并不能访问正确的网络地址，脚本异常退出")
@@ -287,7 +189,7 @@ class VoteBot:
             else:
                 break
 
-    def _find_link_by_name(self, name):
+    def find_link_by_name(self, name):
         if name in self.number:
             return self.number[name]
         else:
@@ -297,33 +199,12 @@ class VoteBot:
         if self.driver:
             self.driver.close()
 
-    def inputCheck(self, msg, val):
-        return RAWINPUT(msg) == val
-
-    def getLinkWithNamecheck(self, name, inputCheck=True):
-        nname, ename, url = self._find_link_by_name(name)
-        if not url:
-            return None, '(%s)不是有效的成员姓名,请检查你的输入' % name
-
-        if inputCheck:
-            s = RAWINPUT("确认要投票给(%s),请再次输入成员姓名:" % nname)
-            if s != nname:
-                return None, '输入(%s)与预期不符,退出程序' % s
-        return url, ''
 
     def serialCheck(self, s1, s2=None):
         return _serialCheck(s1, s2)
 
 
 def countdown(lineLength, ds=1, fs='=', fs2=['-', '\\', '|', '/'], bs=''):
-    def ext(signum, frame):
-        print('')
-        ERROR('您使用(ctrl + c)主动退出了程序')
-        exit(0)
-
-    signal.signal(signal.SIGINT, ext)
-    signal.signal(signal.SIGTERM, ext)
-
     lineTmpla = '{:%s<%s} {} {:<2}' % (bs, lineLength)
     for s in range(lineLength):
         j = lineLength - s
@@ -354,6 +235,7 @@ def _serialCheck(s1, s2=None):
 def _argparse():
     parser = argparse.ArgumentParser(description="AKB48 2018年世界总选举自助投票程序")
     parser.add_argument('-headless', action='store_true', help='启用浏览器无头模式')
+    parser.add_argument('-noimages', action='store_true', help='启用浏览器无图模式')
     parser.set_defaults(func=lambda x: PRINT('use (-h)'))
 
     subparsers = parser.add_subparsers()
@@ -398,37 +280,11 @@ def oneVote(arg):
         bot.close()
 
 
-def split(fromfile, todir, chunkLineSize):
-    if not os.path.exists(todir):  # check whether todir exists or not
-        os.mkdir(todir)
-    else:
-        for fname in os.listdir(todir):
-            os.remove(os.path.join(todir, fname))
-    partnum = 0
-    with open(fromfile, 'rb') as input:
-        while True:
-            chunk = input.readlines(chunkLineSize)
-            if not chunk:  break
-            filename = os.path.join(todir, ('part%04d' % partnum))
-            with open(filename, 'wb') as out:
-                out.writelines(chunk)
-            partnum += 1
-    return partnum
-
-
-def batchVoteSingleton(args):
-    if args.file and not os.path.exists(args.file):
-        ERROR('(%s)文件未找到' % args.file)
-    else:
-        bot = botInit(args)
-        INFO(bot.voteFromFile(args.file, args.name, args.delay))
-        bot.close()
-
-
 def func(args, fname):
     bot = botInit(args)
-    nname, ename, url = bot._find_link_by_name(args.name)
+    nname, ename, url = bot.find_link_by_name(args.name)
     if url:
+        threading.current_thread().setName(os.path.basename(fname))
         INFO(bot.voteBatchNoSafeCheck(fname, url, args.name, args.delay))
     else:
         INFO('(%s)不是有效的成员姓名,请检查你的输入' % name)
@@ -436,43 +292,62 @@ def func(args, fname):
 
 
 def batchVoteMultiProcessing(args):
-    if args.pnum[0] <= 1:
-        batchVoteSingleton(args)
-        return
-
-    from multiprocessing import Pool, cpu_count
     if args.file and not os.path.exists(args.file):
         ERROR('(%s)文件未找到' % args.file)
+        return
+
+    s = RAWINPUT("确认要投票给(%s),请再次输入成员姓名:" % args.name)
+    if s != args.name:
+        ERROR('输入(%s)与预期不符,退出程序' % s)
+        return
+
+    bot = botInit(args)
+    INFO("验证成员姓名(%s)合法性" % args.name)
+    nname, ename, url = bot.find_link_by_name(args.name)
+    if not url:
+        ERROR('(%s)不是有效的成员姓名,请检查你的输入' % args.name)
+        return
+
+    INFO('验证成功，倒计时13s后开始投票给(%s),如果有任何疑问，您可以使用(ctrl + c)主动退出程序' % args.name)
+
+    def ext(signum, frame):
+        print('')
+        ERROR('您使用(ctrl + c)主动退出了程序')
+        exit(0)
+
+    signal.signal(signal.SIGINT, ext)
+    signal.signal(signal.SIGTERM, ext)
+
+    countdown(13)
+    INFO('投票开始(%s)' % args.name)
+
+    if args.pnum[0] <= 1:
+        INFO(bot.voteBatchNoSafeCheck(args.file, url, args.name, args.delay))
+        bot.close()
     else:
-        s = RAWINPUT("确认要投票给(%s),请再次输入成员姓名:" % args.name)
-        if s != args.name:
-            ERROR('输入(%s)与预期不符,退出程序' % s)
-        else:
-            INFO('验证成功，倒计时13s后开始投票给(%s),如果有任何疑问，您可以使用(ctrl + c)主动退出程序' % args.name)
-            countdown(13)
-            INFO('投票开始(%s)' % args.name)
-
-            p = Pool(cpu_count() * 2 if (args.pnum[0] > cpu_count() * 2) else args.pnum[0])
-            tempFileCount = split(args.file, 'temp', args.pnum[1] if args.pnum[1] > 0 else 1024)
-            for partnum in range(tempFileCount):
-                fname = 'temp\\part%04d' % partnum
-                INFO(fname)
-                p.apply_async(func, (args, fname))
-                time.sleep(0.5)
-            INFO('...........')
-            p.close()
-            p.join()
+        bot.close()
+        dirname = '%s-%s' % (args.name, args.file)
+        tempFileCount = ft.split(args.file, dirname,
+                                 args.pnum[1] if args.pnum[1] > 0 else 1024)
+        p = Pool(cpu_count() * 2 if (args.pnum[0] > cpu_count() * 2) else args.pnum[0])
+        for partnum in range(tempFileCount):
+            fname = os.path.join(dirname, 'part%04d' % partnum)
+            p.apply_async(func, (args, fname))
+        p.close()
+        p.join()
+        fname = os.path.join(dirname, args.file + ".log")
+        INFO('合并文件到(%s)'%fname)
+        ft.merge(dirname, fname)
 
 
-def botInit(arg):
+def botInit(args):
     try:
-        bot = VoteBot(arg.headless)
+        bot = VoteBot(args.headless,args.noimages)
         bot.initVoteInfo()
         return bot
     except Exception as e:
         ERROR(e)
         sys.exit(0)
-
 
 if __name__ == "__main__":
     args = _argparse()
